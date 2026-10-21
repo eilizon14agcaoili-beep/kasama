@@ -34,6 +34,17 @@ jobs:
           npx cap add android || true
           npx cap sync android
 
+      - name: Inject Android Permissions to Manifest
+        run: |
+          MANIFEST_PATH="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST_PATH" ]; then
+            sed -i '/<\/manifest>/i \    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />' "$MANIFEST_PATH"
+            echo "Permissions injected successfully!"
+          else
+            echo "Manifest file not found!"
+            exit 1
+          fi
+
       - name: Build APK via Gradle
         run: |
           cd android
