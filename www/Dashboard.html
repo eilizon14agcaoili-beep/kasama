@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RGCD – Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="app">
+  <!-- Toast Notification Banner -->
+  <div id="toast" class="toast hidden" role="alert"></div>
+
+  <header class="topbar">
+    <div class="topbar__left">
+      <strong class="brand">REGCRIS</strong>
+      <div id="circle-chip" class="chip hidden">
+        <span id="circle-name"></span>
+        <span class="chip__code">Code <b id="circle-code"></b></span>
+        <button type="button" id="copy-code" class="link">Copy</button>
+      </div>
+    </div>
+    <div class="topbar__right">
+      <span id="user-name"></span>
+      <button class="btn btn--ghost hidden" id="leave" type="button">Leave circle</button>
+      <button class="btn btn--ghost" id="logout" type="button">Log out</button>
+    </div>
+  </header>
+
+  <p id="loading" class="center-msg" role="status">Loading…</p>
+
+  <!-- Shown when the user has no circle yet -->
+  <main id="gate" class="gate hidden">
+    <div class="gate__intro">
+      <h1>Start your circle</h1>
+      <p>A circle is your family or group. Everyone in it shares one map, one chat, and one walkie talkie.</p>
+    </div>
+    <div class="gate__cards">
+      <form id="create-form" class="panel" novalidate>
+        <h2>Create a circle</h2>
+        <label for="circle-name-input">Circle name</label>
+        <input id="circle-name-input" type="text" maxlength="30" placeholder="Family">
+        <p class="error" id="create-error" role="alert"></p>
+        <button class="btn" type="submit">Create circle</button>
+      </form>
+
+      <form id="join-form" class="panel" novalidate>
+        <h2>Join with a code</h2>
+        <label for="code-input">Invite code</label>
+        <input id="code-input" type="text" maxlength="6" autocapitalize="characters" autocomplete="off" placeholder="6 characters">
+        <p class="error" id="join-error" role="alert"></p>
+        <button class="btn" type="submit">Join circle</button>
+      </form>
+    </div>
+  </main>
+
+  <!-- Shown when the user is in a circle -->
+  <main id="circle-view" class="dash hidden">
+    <section class="panel panel--map" aria-label="Map">
+      <div class="map-head">
+        <h3>Map</h3>
+        <button id="share-btn" class="btn btn--small" type="button">Share my location</button>
+      </div>
+      <p id="map-status" class="map-status" role="status">Your location stays private until you tap Share my location.</p>
+      <div id="map"></div>
+    </section>
+
+    <section class="panel" aria-label="Members">
+      <h3>Members <span class="count" id="member-count">0</span></h3>
+      <ul id="members" class="members"></ul>
+    </section>
+
+    <section class="panel panel--chat" aria-label="Chat">
+      <h3>Chat</h3>
+      <div class="chat__log" id="chat-log">
+        <p class="empty" id="chat-empty">No messages yet. Say hi!</p>
+        <ul class="chat__list" id="chat-list"></ul>
+      </div>
+      <p class="error chat__error" id="chat-error" role="alert"></p>
+      <form class="chat__row" id="chat-form" autocomplete="off">
+        <input id="chat-input" type="text" maxlength="500" placeholder="Message your circle" aria-label="Message">
+        <button class="btn btn--small" type="submit">Send</button>
+      </form>
+    </section>
+
+    <section class="panel panel--ptt" aria-label="Walkie talkie">
+      <h3>Walkie talkie</h3>
+      <button class="ptt" id="ptt" type="button">Hold to talk</button>
+      <p class="hint" id="ptt-status" role="status">Hold the button and speak. Release to send.</p>
+    </section>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script type="module" src="dashboard.js"></script>
+</body>
+</html>
