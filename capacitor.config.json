@@ -1,5 +1,8 @@
 {
-  "appId": "com.kasama.app",
-  "appName": "Kasama",
-  "webDir": "www"
+  "appId": "com.rgcd.app",
+  "appName": "RGCD",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  }
 }
