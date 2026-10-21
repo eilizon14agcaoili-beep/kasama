@@ -8,13 +8,13 @@ import {
 const db = getFirestore(app);
 const $ = (id) => document.getElementById(id);
 
-let me = null;            // { uid, name }
+let me = null;             // { uid, name }
 let circle = null;        // { id, name, code, ownerId }
 let unsubMembers = null;
 let unsubLocs = null;
 let unsubChat = null;
 let unsubVoiceSignal = null;
-let chatStick = true;     // scroll to bottom on next render
+let chatStick = true;      // scroll to bottom on next render
 
 // map + location state
 let map = null;
@@ -75,10 +75,8 @@ function setStatus(text, type = "default") {
   if (!statusEl) return;
   statusEl.textContent = text;
   
-  // Alisin lahat ng lumang status classes
   statusEl.classList.remove("active", "refreshing", "error");
   
-  // Idagdag ang tamang kulay batay sa type (active = green, refreshing = yellow, error = red)
   if (type === "active") {
     statusEl.classList.add("active");
   } else if (type === "refreshing") {
@@ -91,7 +89,7 @@ function setStatus(text, type = "default") {
 // ---------- start ----------
 onAuthStateChanged(auth, async (user) => {
   if (!user) {
-    window.location.href = "index.html";
+    window.location.replace("index.html");
     return;
   }
   me = { uid: user.uid, name: user.displayName || user.email.split("@")[0] };
@@ -261,9 +259,9 @@ $("chat-form").addEventListener("submit", async (e) => {
   }
 });
 
-// ---------- REAL-TIME WEBRTC WALKIE TALKIE (NO DATABASE STORAGE) ----------
+// ---------- REAL-TIME WEBRTC WALKIE TALKIE ----------
 function setPttStatus(text) {
-  $("ptt-status").textContent = text;
+  if ($("ptt-status")) $("ptt-status").textContent = text;
 }
 
 function idleStatus() {
@@ -332,8 +330,9 @@ async function handleIncomingOffer(data, signalDocId) {
 async function startStreamingAudio() {
   if (!circle) return;
   try {
+    // Humihingi ng mikropono sa Android app container
     localAudioStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true }
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
 
     closePeerConnection();
@@ -373,8 +372,8 @@ async function startStreamingAudio() {
 
   } catch (err) {
     console.error("Mic error:", err);
-    setPttStatus("Microphone access failed.");
-    showToast("Microphone access failed.", true);
+    setPttStatus("Microphone access failed. Check app permissions.");
+    showToast("Microphone access failed. Allow mic in phone settings.", true);
   }
 }
 
@@ -386,8 +385,10 @@ async function stopStreamingAudio() {
   closePeerConnection();
 
   const btn = $("ptt");
-  btn.classList.remove("is-live", "is-hearing");
-  btn.textContent = "Hold to talk";
+  if (btn) {
+    btn.classList.remove("is-live", "is-hearing");
+    btn.textContent = "Hold to talk";
+  }
   idleStatus();
 
   if (circle) {
@@ -408,18 +409,21 @@ function closePeerConnection() {
 }
 
 const pttBtn = $("ptt");
-pttBtn.addEventListener("pointerdown", (e) => {
-  e.preventDefault();
-  pttBtn.setPointerCapture(e.pointerId);
-  startStreamingAudio();
-});
-pttBtn.addEventListener("pointerup", stopStreamingAudio);
-pttBtn.addEventListener("pointercancel", stopStreamingAudio);
-pttBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+if (pttBtn) {
+  pttBtn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    pttBtn.setPointerCapture(e.pointerId);
+    startStreamingAudio();
+  });
+  pttBtn.addEventListener("pointerup", stopStreamingAudio);
+  pttBtn.addEventListener("pointercancel", stopStreamingAudio);
+  pttBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+}
 
 // ---------- members list ----------
 function renderMembers() {
   const list = $("members");
+  if (!list) return;
   list.replaceChildren();
   $("member-count").textContent = people.length;
 
@@ -535,16 +539,17 @@ setInterval(() => {
   }
 }, 30000);
 
-// ---------- LOCATION SHARING & 30-SECOND REFRESH ----------
+// ---------- LOCATION SHARING & REFRESH ----------
 function updateShareButton() {
   const btn = $("share-btn");
+  if (!btn) return;
   btn.textContent = sharing ? "Pause sharing" : "Share my location";
   btn.classList.toggle("is-sharing", sharing);
 }
 
 function startSharing() {
   if (!navigator.geolocation) {
-    const errText = "This browser can't share location.";
+    const errText = "This device can't share location.";
     setStatus(errText, "error");
     showToast(errText, true);
     return;
@@ -552,7 +557,7 @@ function startSharing() {
   sharing = true;
   lastWrite = 0;
   updateShareButton();
-  setStatus("Finding your location… allow it if your browser asks.", "refreshing");
+  setStatus("Finding your location… please allow permission.", "refreshing");
 
   watchId = navigator.geolocation.watchPosition(onPosition, onPositionError, {
     enableHighAccuracy: true,
@@ -591,8 +596,7 @@ async function onPosition(pos, force = false) {
       accuracy: Math.round(accuracy),
       updatedAt: now,
     });
-    // DITO NAGIGING GREEN ANG INDICATOR DAHIL ACTIVE NA ANG SHARING
-    setStatus("Sharing your location with " + circle.name + ". Tap Pause sharing to stop.", "active");
+    setStatus("Sharing your location with " + circle.name + ".", "active");
   } catch (err) {
     const errText = friendlyError(err);
     setStatus(errText, "error");
@@ -603,7 +607,7 @@ async function onPosition(pos, force = false) {
 async function onPositionError(err) {
   if (err.code === 1) {
     await stopSharing();
-    const errText = "Location is blocked. Click the lock icon in the address bar, allow Location, then try again.";
+    const errText = "Location is blocked. Please allow Location in your phone settings.";
     setStatus(errText, "error");
     showToast(errText, true);
   } else if (err.code === 2) {
@@ -621,7 +625,7 @@ async function stopSharing(message) {
 
   const wasSharing = sharing;
   sharing = false;
-  if (document.getElementById("share-btn")) updateShareButton();
+  if ($("share-btn")) updateShareButton();
   if (wasSharing && circle) {
     try {
       await deleteDoc(doc(db, "circles", circle.id, "locations", me.uid));
