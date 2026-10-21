@@ -11,7 +11,7 @@ let mode = "login"; // "login" or "signup"
 let busy = false; // blocks the auto-redirect while we save the user's name
 
 onAuthStateChanged(auth, (user) => {
-  if (user && !busy) window.location.href = "dashboard.html";
+  if (user && !busy) window.location.replace("dashboard.html");
 });
 
 function setMode(next) {
@@ -61,7 +61,7 @@ $("auth-form").addEventListener("submit", async (e) => {
     } else {
       await signInWithEmailAndPassword(auth, email, password);
     }
-    window.location.href = "dashboard.html";
+    window.location.replace("dashboard.html");
   } catch (err) {
     busy = false;
     $("error").textContent = messages[err.code] || "Something went wrong. (" + err.code + ")";
