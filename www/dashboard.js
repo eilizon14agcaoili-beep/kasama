@@ -27,8 +27,8 @@ let lastWrite = 0;
 let didFit = false;
 let locationSyncInterval = null;
 
-// ---------- WebRTC Walkie-Talkie State ----------
-let peerConnection = null;
+// ---------- Buzz-Style Multi-Peer Walkie-Talkie State ----------
+let peerConnections = new Map(); // targetUid -> RTCPeerConnection
 let localAudioStream = null;
 const rtcConfig = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
@@ -106,6 +106,7 @@ onAuthStateChanged(auth, async (user) => {
 });
 
 $("logout").addEventListener("click", async () => {
+  await stopStreamingAudio();
   await stopSharing();
   signOut(auth);
 });
@@ -259,7 +260,7 @@ $("chat-form").addEventListener("submit", async (e) => {
   }
 });
 
-// ---------- REAL-TIME WEBRTC WALKIE TALKIE ----------
+// ---------- BUZZ-STYLE MULTI-PEER GROUP WALKIE TALKIE ----------
 function setPttStatus(text) {
   if ($("ptt-status")) $("ptt-status").textContent = text;
 }
@@ -270,24 +271,31 @@ function idleStatus() {
 
 function setupWebRTCPTT() {
   if (unsubVoiceSignal) unsubVoiceSignal();
-  
+
   const signalsRef = collection(db, "circles", circle.id, "signals");
   unsubVoiceSignal = onSnapshot(signalsRef, (snapshot) => {
     snapshot.docChanges().forEach(async (change) => {
       if (change.type === "added") {
         const data = change.doc.data();
         if (data.senderUid === me.uid) return;
+        if (data.targetUid && data.targetUid !== me.uid) return;
 
         if (data.type === "offer") {
           await handleIncomingOffer(data, change.doc.id);
-        } else if (data.type === "answer" && peerConnection) {
-          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
+        } else if (data.type === "answer") {
+          const pc = peerConnections.get(data.senderUid);
+          if (pc && pc.signalingState !== "closed") {
+            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          }
           deleteDoc(doc(db, "circles", circle.id, "signals", change.doc.id));
-        } else if (data.type === "candidate" && peerConnection) {
-          await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } else if (data.type === "candidate") {
+          const pc = peerConnections.get(data.senderUid);
+          if (pc && pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          }
           deleteDoc(doc(db, "circles", circle.id, "signals", change.doc.id));
         } else if (data.type === "hangup") {
-          closePeerConnection();
+          closePeerConnection(data.senderUid);
           setPttStatus(data.senderName + " stopped talking.");
           setTimeout(idleStatus, 1500);
           deleteDoc(doc(db, "circles", circle.id, "signals", change.doc.id));
@@ -298,27 +306,36 @@ function setupWebRTCPTT() {
 }
 
 async function handleIncomingOffer(data, signalDocId) {
-  closePeerConnection();
   setPttStatus(data.senderName + " is talking live…");
-  $("ptt").classList.add("is-hearing");
+  const btn = $("ptt");
+  if (btn) btn.classList.add("is-hearing");
 
-  peerConnection = new RTCPeerConnection(rtcConfig);
+  closePeerConnection(data.senderUid);
+  const pc = new RTCPeerConnection(rtcConfig);
+  peerConnections.set(data.senderUid, pc);
 
-  peerConnection.ontrack = (event) => {
-    const audio = new Audio();
+  pc.ontrack = (event) => {
+    let audio = document.getElementById("audio-" + data.senderUid);
+    if (!audio) {
+      audio = new Audio();
+      audio.id = "audio-" + data.senderUid;
+      audio.autoplay = true;
+      document.body.appendChild(audio);
+    }
     audio.srcObject = event.streams[0];
     audio.play().catch(() => {
       document.addEventListener("pointerdown", () => audio.play(), { once: true });
     });
   };
 
-  await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  const answer = await peerConnection.createAnswer();
-  await peerConnection.setLocalDescription(answer);
+  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
 
   await addDoc(collection(db, "circles", circle.id, "signals"), {
     senderUid: me.uid,
     senderName: me.name,
+    targetUid: data.senderUid,
     type: "answer",
     sdp: answer,
     createdAt: serverTimestamp()
@@ -330,50 +347,67 @@ async function handleIncomingOffer(data, signalDocId) {
 async function startStreamingAudio() {
   if (!circle) return;
   try {
-    // Humihingi ng mikropono sa Android app container
     localAudioStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-
-    closePeerConnection();
-    peerConnection = new RTCPeerConnection(rtcConfig);
-
-    localAudioStream.getTracks().forEach((track) => {
-      peerConnection.addTrack(track, localAudioStream);
-    });
-
-    peerConnection.onicecandidate = (event) => {
-      if (event.candidate) {
-        addDoc(collection(db, "circles", circle.id, "signals"), {
-          senderUid: me.uid,
-          senderName: me.name,
-          type: "candidate",
-          candidate: event.candidate.toJSON(),
-          createdAt: serverTimestamp()
-        });
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
       }
-    };
-
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-
-    await addDoc(collection(db, "circles", circle.id, "signals"), {
-      senderUid: me.uid,
-      senderName: me.name,
-      type: "offer",
-      sdp: offer,
-      createdAt: serverTimestamp()
     });
+
+    closeAllPeerConnections();
+
+    const otherMembers = people.filter((p) => p.id !== me.uid);
+    if (otherMembers.length === 0) {
+      setPttStatus("Transmitting... (No other members in circle yet)");
+    } else {
+      setPttStatus("Transmitting live voice to circle…");
+    }
 
     const btn = $("ptt");
-    btn.classList.add("is-live");
-    btn.textContent = "Live Talking…";
-    setPttStatus("Transmitting live voice… Release to stop.");
+    if (btn) {
+      btn.classList.add("is-live");
+      btn.textContent = "Live Talking…";
+    }
+
+    for (const member of otherMembers) {
+      const pc = new RTCPeerConnection(rtcConfig);
+      peerConnections.set(member.id, pc);
+
+      localAudioStream.getTracks().forEach((track) => {
+        pc.addTrack(track, localAudioStream);
+      });
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          addDoc(collection(db, "circles", circle.id, "signals"), {
+            senderUid: me.uid,
+            senderName: me.name,
+            targetUid: member.id,
+            type: "candidate",
+            candidate: event.candidate.toJSON(),
+            createdAt: serverTimestamp()
+          });
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      await addDoc(collection(db, "circles", circle.id, "signals"), {
+        senderUid: me.uid,
+        senderName: me.name,
+        targetUid: member.id,
+        type: "offer",
+        sdp: offer,
+        createdAt: serverTimestamp()
+      });
+    }
 
   } catch (err) {
     console.error("Mic error:", err);
-    setPttStatus("Microphone access failed. Check app permissions.");
-    showToast("Microphone access failed. Allow mic in phone settings.", true);
+    setPttStatus("Microphone access failed. Check permissions.");
+    showToast("Microphone access failed.", true);
   }
 }
 
@@ -382,7 +416,8 @@ async function stopStreamingAudio() {
     localAudioStream.getTracks().forEach((t) => t.stop());
     localAudioStream = null;
   }
-  closePeerConnection();
+  
+  closeAllPeerConnections();
 
   const btn = $("ptt");
   if (btn) {
@@ -401,11 +436,23 @@ async function stopStreamingAudio() {
   }
 }
 
-function closePeerConnection() {
-  if (peerConnection) {
-    peerConnection.close();
-    peerConnection = null;
+function closePeerConnection(uid) {
+  if (peerConnections.has(uid)) {
+    const pc = peerConnections.get(uid);
+    if (pc) pc.close();
+    peerConnections.delete(uid);
   }
+  const audio = document.getElementById("audio-" + uid);
+  if (audio) audio.remove();
+}
+
+function closeAllPeerConnections() {
+  for (const [uid, pc] of peerConnections) {
+    if (pc) pc.close();
+    const audio = document.getElementById("audio-" + uid);
+    if (audio) audio.remove();
+  }
+  peerConnections.clear();
 }
 
 const pttBtn = $("ptt");
@@ -714,13 +761,14 @@ $("join-form").addEventListener("submit", async (e) => {
 $("leave").addEventListener("click", async () => {
   if (!confirm("Leave " + circle.name + "? You can rejoin later with the invite code.")) return;
   try {
+    await stopStreamingAudio();
     await stopSharing();
     if (unsubMembers) unsubMembers();
     if (unsubLocs) unsubLocs();
     if (unsubChat) unsubChat();
     if (unsubVoiceSignal) unsubVoiceSignal();
     unsubMembers = unsubLocs = unsubChat = unsubVoiceSignal = null;
-    closePeerConnection();
+    closeAllPeerConnections();
 
     for (const m of markers.values()) m.remove();
     markers.clear();
