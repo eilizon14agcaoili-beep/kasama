@@ -1,6 +1,5 @@
 {
   "appId": "com.kasama.app",
   "appName": "Kasama",
-  "webDir": ".",
-  "bundledWebRuntime": false
+  "webDir": "www"
 }
