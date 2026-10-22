@@ -9,30 +9,27 @@ const db = getFirestore(app);
 const $ = (id) => document.getElementById(id);
 
 let me = null;             // { uid, name }
-let circle = null;        // { id, name, code, ownerId }
+let circle = null;         // { id, name, code, ownerId }
 let unsubMembers = null;
 let unsubLocs = null;
 let unsubChat = null;
-let unsubVoiceSignal = null;
-let chatStick = true;      // scroll to bottom on next render
+let chatStick = true;
 
 // map + location state
 let map = null;
 const markers = new Map();   // uid -> Leaflet marker
 let locs = new Map();        // uid -> { name, lat, lng, accuracy, updatedAt }
 let people = [];             // current members
+let didFit = false;
+
+// ---------- location sharing state ----------
+const LOCATION_INTERVAL_MS = 10000;   // auto-refresh every 10 seconds
 let watchId = null;
 let sharing = false;
-let lastWrite = 0;
-let didFit = false;
-let locationSyncInterval = null;
-
-// ---------- Buzz-Style Multi-Peer Walkie-Talkie State ----------
-let peerConnections = new Map(); // targetUid -> RTCPeerConnection
-let localAudioStream = null;
-const rtcConfig = {
-  iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-};
+let lastPos = null;                   // latest GPS fix from watchPosition
+let locationTimer = null;
+let locationBusy = false;
+let wakeLock = null;
 
 // ---------- screens ----------
 function show(which) {
@@ -58,32 +55,25 @@ function showFatal(err) {
 }
 
 // ---------- Toast & Status Indicator Helpers ----------
+let toastTimer = null;
 function showToast(message, isError = false) {
   const toast = $("toast");
   if (!toast) return;
   toast.textContent = message;
   toast.classList.toggle("error", isError);
   toast.classList.remove("hidden");
-  
-  setTimeout(() => {
-    toast.classList.add("hidden");
-  }, 4000);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.add("hidden"), 4000);
 }
 
 function setStatus(text, type = "default") {
   const statusEl = $("map-status");
   if (!statusEl) return;
   statusEl.textContent = text;
-  
   statusEl.classList.remove("active", "refreshing", "error");
-  
-  if (type === "active") {
-    statusEl.classList.add("active");
-  } else if (type === "refreshing") {
-    statusEl.classList.add("refreshing");
-  } else if (type === "error") {
-    statusEl.classList.add("error");
-  }
+  if (type === "active") statusEl.classList.add("active");
+  else if (type === "refreshing") statusEl.classList.add("refreshing");
+  else if (type === "error") statusEl.classList.add("error");
 }
 
 // ---------- start ----------
@@ -106,7 +96,7 @@ onAuthStateChanged(auth, async (user) => {
 });
 
 $("logout").addEventListener("click", async () => {
-  await stopStreamingAudio();
+  teardownVoice();
   await stopSharing();
   signOut(auth);
 });
@@ -123,6 +113,10 @@ function timeAgo(ms) {
   if (s < 3600) return Math.round(s / 60) + " min ago";
   if (s < 86400) return Math.round(s / 3600) + " hr ago";
   return Math.round(s / 86400) + " d ago";
+}
+
+function randomId() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
 // ---------- circle: open ----------
@@ -145,6 +139,7 @@ async function openCircle(circleId) {
     (s) => {
       people = s.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => a.name.localeCompare(b.name));
       renderMembers();
+      syncPeers(); // keep voice connections in sync with the member list
     },
     (err) => showFatal(err)
   );
@@ -166,7 +161,10 @@ async function openCircle(circleId) {
   );
 
   subscribeChat();
-  setupWebRTCPTT();
+  setupVoice();
+
+  // Auto-resume sharing if the user had it on before (e.g. after a page reload)
+  if (getSharePref() && !sharing) startSharing();
 }
 
 // ---------- chat ----------
@@ -260,212 +258,438 @@ $("chat-form").addEventListener("submit", async (e) => {
   }
 });
 
-// ---------- BUZZ-STYLE MULTI-PEER GROUP WALKIE TALKIE ----------
+// =====================================================================
+//  WALKIE-TALKIE (persistent mesh, full-duplex, many speakers at once)
+//
+//  How it works now:
+//   - Every member keeps ONE always-on WebRTC connection to every other
+//     member (mesh). Nobody has to "start a call" when pressing the button.
+//   - Pressing the button only turns the mic track ON (track.enabled), so
+//     audio starts instantly and nothing needs to be renegotiated.
+//   - Each peer has its own <audio> element, so the browser mixes any number
+//     of people talking at the same time.
+//   - The mic is opened once and re-opened automatically if the browser
+//     kills it (this fixes "nawawala yung mic after matagal").
+// =====================================================================
+
+const rtcConfig = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    // IMPORTANT: add a TURN server for mobile data / strict networks.
+    // Without TURN, many phones on mobile data can NOT hear each other.
+    // { urls: "turn:YOUR_TURN_HOST:3478", username: "USER", credential: "PASS" },
+  ],
+  iceCandidatePoolSize: 2,
+};
+
+const peers = new Map();        // uid -> entry (see getEntry)
+const remoteTalkers = new Map(); // uid -> name of people currently talking
+let unsubVoiceSignal = null;
+let signalQueue = Promise.resolve();
+let healthTimer = null;
+
+let micTrack = null;
+let micPromise = null;
+let pttHeld = false;
+let talking = false;
+
+function signalsCol() {
+  return collection(db, "circles", circle.id, "signals");
+}
+
+async function sendSignal(targetUid, type, session, payload = {}) {
+  if (!circle) return;
+  try {
+    await addDoc(signalsCol(), {
+      senderUid: me.uid,
+      senderName: me.name,
+      targetUid,
+      type,
+      session,
+      ...payload,
+      createdAt: serverTimestamp(),
+    });
+  } catch (err) {
+    console.warn("signal failed", err);
+  }
+}
+
+// ----- UI -----
 function setPttStatus(text) {
   if ($("ptt-status")) $("ptt-status").textContent = text;
 }
 
-function idleStatus() {
-  setPttStatus("Hold the button and speak. Release to send.");
+function connectedCount() {
+  let n = 0;
+  for (const e of peers.values()) if (e.pc && e.pc.connectionState === "connected") n++;
+  return n;
 }
 
-function setupWebRTCPTT() {
-  if (unsubVoiceSignal) unsubVoiceSignal();
-
-  const signalsRef = collection(db, "circles", circle.id, "signals");
-  unsubVoiceSignal = onSnapshot(signalsRef, (snapshot) => {
-    snapshot.docChanges().forEach(async (change) => {
-      if (change.type === "added") {
-        const data = change.doc.data();
-        if (data.senderUid === me.uid) return;
-        if (data.targetUid && data.targetUid !== me.uid) return;
-
-        if (data.type === "offer") {
-          await handleIncomingOffer(data, change.doc.id);
-        } else if (data.type === "answer") {
-          const pc = peerConnections.get(data.senderUid);
-          if (pc && pc.signalingState !== "closed") {
-            await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-          }
-          deleteDoc(doc(db, "circles", circle.id, "signals", change.doc.id));
-        } else if (data.type === "candidate") {
-          const pc = peerConnections.get(data.senderUid);
-          if (pc && pc.remoteDescription) {
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-          }
-          deleteDoc(doc(db, "circles", circle.id, "signals", change.doc.id));
-        } else if (data.type === "hangup") {
-          closePeerConnection(data.senderUid);
-          setPttStatus(data.senderName + " stopped talking.");
-          setTimeout(idleStatus, 1500);
-          deleteDoc(doc(db, "circles", circle.id, "signals", change.doc.id));
-        }
-      }
-    });
-  });
-}
-
-async function handleIncomingOffer(data, signalDocId) {
-  setPttStatus(data.senderName + " is talking live…");
+function updateVoiceUI() {
   const btn = $("ptt");
-  if (btn) btn.classList.add("is-hearing");
-
-  closePeerConnection(data.senderUid);
-  const pc = new RTCPeerConnection(rtcConfig);
-  peerConnections.set(data.senderUid, pc);
-
-  pc.ontrack = (event) => {
-    let audio = document.getElementById("audio-" + data.senderUid);
-    if (!audio) {
-      audio = new Audio();
-      audio.id = "audio-" + data.senderUid;
-      audio.autoplay = true;
-      document.body.appendChild(audio);
-    }
-    audio.srcObject = event.streams[0];
-    audio.play().catch(() => {
-      document.addEventListener("pointerdown", () => audio.play(), { once: true });
-    });
-  };
-
-  await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-
-  await addDoc(collection(db, "circles", circle.id, "signals"), {
-    senderUid: me.uid,
-    senderName: me.name,
-    targetUid: data.senderUid,
-    type: "answer",
-    sdp: answer,
-    createdAt: serverTimestamp()
-  });
-
-  deleteDoc(doc(db, "circles", circle.id, "signals", signalDocId));
+  if (btn) {
+    btn.classList.toggle("is-live", talking);
+    btn.classList.toggle("is-hearing", remoteTalkers.size > 0);
+    btn.textContent = talking ? "Live Talking…" : "Hold to talk";
+  }
+  if (talking) {
+    setPttStatus("Transmitting live to " + connectedCount() + " connected.");
+  } else if (remoteTalkers.size > 0) {
+    setPttStatus([...remoteTalkers.values()].join(", ") + (remoteTalkers.size > 1 ? " are talking…" : " is talking…"));
+  } else {
+    const others = peers.size;
+    setPttStatus(
+      others === 0
+        ? "No other members yet."
+        : "Hold the button and speak. (" + connectedCount() + "/" + others + " connected)"
+    );
+  }
 }
 
-async function startStreamingAudio() {
-  if (!circle) return;
-  try {
-    localAudioStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
+// ----- microphone (opened once, auto-recovers) -----
+async function ensureMic() {
+  if (micTrack && micTrack.readyState === "live") return micTrack;
+  if (micPromise) return micPromise;
+
+  micPromise = (async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
-
-    closeAllPeerConnections();
-
-    const otherMembers = people.filter((p) => p.id !== me.uid);
-    if (otherMembers.length === 0) {
-      setPttStatus("Transmitting... (No other members in circle yet)");
-    } else {
-      setPttStatus("Transmitting live voice to circle…");
+    const track = stream.getAudioTracks()[0];
+    track.enabled = false; // silent until the button is held
+    track.addEventListener("ended", () => {
+      if (micTrack === track) micTrack = null; // will be re-opened on next press
+    });
+    micTrack = track;
+    for (const e of peers.values()) {
+      if (e.sender) e.sender.replaceTrack(track).catch(() => {});
     }
+    return track;
+  })();
 
-    const btn = $("ptt");
-    if (btn) {
-      btn.classList.add("is-live");
-      btn.textContent = "Live Talking…";
+  try {
+    return await micPromise;
+  } finally {
+    micPromise = null;
+  }
+}
+
+function broadcastTalking(state) {
+  const msg = JSON.stringify({ talking: state });
+  for (const e of peers.values()) {
+    if (e.dc && e.dc.readyState === "open") {
+      try { e.dc.send(msg); } catch { /* ignore */ }
     }
+  }
+}
 
-    for (const member of otherMembers) {
-      const pc = new RTCPeerConnection(rtcConfig);
-      peerConnections.set(member.id, pc);
-
-      localAudioStream.getTracks().forEach((track) => {
-        pc.addTrack(track, localAudioStream);
-      });
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          addDoc(collection(db, "circles", circle.id, "signals"), {
-            senderUid: me.uid,
-            senderName: me.name,
-            targetUid: member.id,
-            type: "candidate",
-            candidate: event.candidate.toJSON(),
-            createdAt: serverTimestamp()
-          });
-        }
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      await addDoc(collection(db, "circles", circle.id, "signals"), {
-        senderUid: me.uid,
-        senderName: me.name,
-        targetUid: member.id,
-        type: "offer",
-        sdp: offer,
-        createdAt: serverTimestamp()
-      });
-    }
-
+async function startTalking() {
+  if (talking || pttHeld) return;
+  pttHeld = true;
+  try {
+    const track = await ensureMic();
+    if (!pttHeld) return;            // released while the mic was opening
+    track.enabled = true;
+    talking = true;
+    broadcastTalking(true);
+    updateVoiceUI();
   } catch (err) {
+    pttHeld = false;
     console.error("Mic error:", err);
     setPttStatus("Microphone access failed. Check permissions.");
     showToast("Microphone access failed.", true);
   }
 }
 
-async function stopStreamingAudio() {
-  if (localAudioStream) {
-    localAudioStream.getTracks().forEach((t) => t.stop());
-    localAudioStream = null;
-  }
-  
-  closeAllPeerConnections();
+function stopTalking() {
+  pttHeld = false;
+  if (!talking) return;
+  talking = false;
+  if (micTrack) micTrack.enabled = false;
+  broadcastTalking(false);
+  updateVoiceUI();
+}
 
-  const btn = $("ptt");
-  if (btn) {
-    btn.classList.remove("is-live", "is-hearing");
-    btn.textContent = "Hold to talk";
+// ----- peers -----
+function getEntry(uid, name) {
+  let e = peers.get(uid);
+  if (!e) {
+    const audio = new Audio();
+    audio.autoplay = true;
+    audio.id = "audio-" + uid;
+    audio.setAttribute("playsinline", "");
+    document.body.appendChild(audio);
+    e = {
+      uid,
+      name: name || "Member",
+      initiator: me.uid < uid,   // lower uid always creates the offer (no collisions)
+      pc: null,
+      dc: null,
+      sender: null,
+      session: null,
+      startedAt: 0,
+      pendingIce: [],
+      audio,
+    };
+    peers.set(uid, e);
+  } else if (name) {
+    e.name = name;
   }
-  idleStatus();
+  return e;
+}
 
-  if (circle) {
-    await addDoc(collection(db, "circles", circle.id, "signals"), {
-      senderUid: me.uid,
-      senderName: me.name,
-      type: "hangup",
-      createdAt: serverTimestamp()
-    });
+function closePc(e) {
+  if (e.dc) { try { e.dc.close(); } catch { /* ignore */ } }
+  if (e.pc) {
+    e.pc.onicecandidate = e.pc.ontrack = e.pc.onconnectionstatechange = null;
+    try { e.pc.close(); } catch { /* ignore */ }
+  }
+  e.pc = null;
+  e.dc = null;
+  e.sender = null;
+  e.session = null;
+  e.audio.srcObject = null;
+  remoteTalkers.delete(e.uid);
+}
+
+function removePeer(uid) {
+  const e = peers.get(uid);
+  if (!e) return;
+  closePc(e);
+  e.audio.remove();
+  peers.delete(uid);
+}
+
+function createPc(e, session) {
+  closePc(e);
+  const pc = new RTCPeerConnection(rtcConfig);
+  e.pc = pc;
+  e.session = session;
+  e.startedAt = Date.now();
+
+  // negotiated data channel: both sides create it with the same id (used for "X is talking")
+  const dc = pc.createDataChannel("ptt", { negotiated: true, id: 0 });
+  e.dc = dc;
+  dc.onopen = () => { if (talking) broadcastTalking(true); };
+  dc.onmessage = (ev) => {
+    try {
+      const { talking: t } = JSON.parse(ev.data);
+      if (t) remoteTalkers.set(e.uid, e.name);
+      else remoteTalkers.delete(e.uid);
+      updateVoiceUI();
+    } catch { /* ignore */ }
+  };
+
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) sendSignal(e.uid, "candidate", session, { candidate: ev.candidate.toJSON() });
+  };
+
+  pc.ontrack = (ev) => {
+    e.audio.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+    e.audio.play().catch(() => { /* will be unlocked on next tap, see unlockAudio */ });
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc !== e.pc) return;
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+      remoteTalkers.delete(e.uid);
+    }
+    updateVoiceUI();
+  };
+
+  return pc;
+}
+
+async function startOffer(e) {
+  if (!circle || !e.initiator) return;
+  const session = randomId();
+  const pc = createPc(e, session);
+  const tx = pc.addTransceiver("audio", { direction: "sendrecv" });
+  e.sender = tx.sender;
+  if (micTrack) tx.sender.replaceTrack(micTrack).catch(() => {});
+
+  try {
+    const offer = await pc.createOffer();
+    if (e.pc !== pc) return;
+    await pc.setLocalDescription(offer);
+    await sendSignal(e.uid, "offer", session, { sdp: { type: offer.type, sdp: offer.sdp } });
+  } catch (err) {
+    console.warn("offer failed", err);
   }
 }
 
-function closePeerConnection(uid) {
-  if (peerConnections.has(uid)) {
-    const pc = peerConnections.get(uid);
-    if (pc) pc.close();
-    peerConnections.delete(uid);
+async function handleOffer(e, data) {
+  const pc = createPc(e, data.session);
+  try {
+    await pc.setRemoteDescription(data.sdp);
+    const tx = pc.getTransceivers().find((t) => t.receiver.track && t.receiver.track.kind === "audio");
+    if (tx) {
+      tx.direction = "sendrecv";
+      e.sender = tx.sender;
+      if (micTrack) tx.sender.replaceTrack(micTrack).catch(() => {});
+    }
+    await flushIce(e);
+    const answer = await pc.createAnswer();
+    if (e.pc !== pc) return;
+    await pc.setLocalDescription(answer);
+    await sendSignal(e.uid, "answer", data.session, { sdp: { type: answer.type, sdp: answer.sdp } });
+  } catch (err) {
+    console.warn("answer failed", err);
   }
-  const audio = document.getElementById("audio-" + uid);
-  if (audio) audio.remove();
 }
 
-function closeAllPeerConnections() {
-  for (const [uid, pc] of peerConnections) {
-    if (pc) pc.close();
-    const audio = document.getElementById("audio-" + uid);
-    if (audio) audio.remove();
+async function handleAnswer(e, data) {
+  const pc = e.pc;
+  if (!pc || data.session !== e.session || pc.signalingState !== "have-local-offer") return;
+  try {
+    await pc.setRemoteDescription(data.sdp);
+    await flushIce(e);
+  } catch (err) {
+    console.warn("set answer failed", err);
   }
-  peerConnections.clear();
 }
+
+async function handleCandidate(e, data) {
+  e.pendingIce.push({ session: data.session, candidate: data.candidate });
+  await flushIce(e);
+}
+
+// ICE candidates can arrive before the remote description, so queue them
+async function flushIce(e) {
+  const pc = e.pc;
+  if (!pc || !pc.remoteDescription) return;
+  const keep = [];
+  for (const item of e.pendingIce) {
+    if (item.session === e.session) {
+      try { await pc.addIceCandidate(item.candidate); } catch { /* ignore */ }
+    } else if (!e.session) {
+      keep.push(item);
+    }
+  }
+  e.pendingIce = keep;
+}
+
+// Start (or restart) the connection to one peer
+function connectPeer(e) {
+  if (e.initiator) {
+    startOffer(e);
+  } else {
+    // ask the initiator to (re)send an offer
+    sendSignal(e.uid, "hello", null);
+  }
+}
+
+function syncPeers() {
+  if (!circle) return;
+  const ids = new Set();
+  for (const p of people) {
+    if (p.id === me.uid) continue;
+    ids.add(p.id);
+    const isNew = !peers.has(p.id);
+    const e = getEntry(p.id, p.name);
+    if (isNew) connectPeer(e);
+  }
+  for (const uid of [...peers.keys()]) {
+    if (!ids.has(uid)) removePeer(uid);
+  }
+  updateVoiceUI();
+}
+
+// Reconnect anything that is dead or stuck
+function healthCheck() {
+  if (!circle) return;
+  const now = Date.now();
+  for (const e of peers.values()) {
+    const st = e.pc ? e.pc.connectionState : null;
+    const dead = !e.pc || st === "failed" || st === "closed";
+    const stuck = st && st !== "connected" && now - e.startedAt > 15000;
+    if (dead || stuck) connectPeer(e);
+  }
+  updateVoiceUI();
+}
+
+function setupVoice() {
+  teardownVoice();
+
+  let first = true;
+  const q = query(signalsCol(), where("targetUid", "==", me.uid));
+  unsubVoiceSignal = onSnapshot(q, (snapshot) => {
+    // Old signals left over from earlier sessions: throw them away
+    if (first) {
+      first = false;
+      snapshot.docs.forEach((d) => deleteDoc(d.ref).catch(() => {}));
+      return;
+    }
+    const order = { hello: 0, offer: 0, answer: 1, candidate: 2 };
+    const added = snapshot.docChanges()
+      .filter((c) => c.type === "added")
+      .map((c) => ({ ref: c.doc.ref, data: c.doc.data() }))
+      .sort((a, b) => (order[a.data.type] ?? 3) - (order[b.data.type] ?? 3));
+
+    for (const { ref, data } of added) {
+      deleteDoc(ref).catch(() => {});
+      signalQueue = signalQueue
+        .then(() => handleSignal(data))
+        .catch((err) => console.warn("signal error", err));
+    }
+  }, (err) => console.warn("signal listener", err));
+
+  healthTimer = setInterval(healthCheck, 8000);
+  syncPeers();
+  updateVoiceUI();
+}
+
+async function handleSignal(data) {
+  if (!circle || data.senderUid === me.uid) return;
+  const e = getEntry(data.senderUid, data.senderName);
+  if (data.type === "hello") {
+    if (e.initiator) await startOffer(e);
+  } else if (data.type === "offer") {
+    await handleOffer(e, data);
+  } else if (data.type === "answer") {
+    await handleAnswer(e, data);
+  } else if (data.type === "candidate") {
+    await handleCandidate(e, data);
+  }
+}
+
+function teardownVoice() {
+  if (unsubVoiceSignal) unsubVoiceSignal();
+  unsubVoiceSignal = null;
+  if (healthTimer) clearInterval(healthTimer);
+  healthTimer = null;
+  stopTalking();
+  for (const uid of [...peers.keys()]) removePeer(uid);
+  remoteTalkers.clear();
+  if (micTrack) { micTrack.stop(); micTrack = null; }
+  updateVoiceUI();
+}
+
+// Mobile browsers block audio until the user taps something: unlock on any tap
+function unlockAudio() {
+  for (const e of peers.values()) {
+    if (e.audio.srcObject && e.audio.paused) e.audio.play().catch(() => {});
+  }
+}
+["pointerdown", "touchend", "keydown"].forEach((ev) =>
+  document.addEventListener(ev, unlockAudio, { passive: true })
+);
 
 const pttBtn = $("ptt");
 if (pttBtn) {
+  pttBtn.style.touchAction = "none";
   pttBtn.addEventListener("pointerdown", (e) => {
     e.preventDefault();
-    pttBtn.setPointerCapture(e.pointerId);
-    startStreamingAudio();
+    try { pttBtn.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    startTalking();
   });
-  pttBtn.addEventListener("pointerup", stopStreamingAudio);
-  pttBtn.addEventListener("pointercancel", stopStreamingAudio);
+  pttBtn.addEventListener("pointerup", stopTalking);
+  pttBtn.addEventListener("pointercancel", stopTalking);
+  pttBtn.addEventListener("lostpointercapture", stopTalking);
   pttBtn.addEventListener("contextmenu", (e) => e.preventDefault());
 }
+window.addEventListener("blur", stopTalking);
 
 // ---------- members list ----------
 function renderMembers() {
@@ -579,19 +803,43 @@ function focusMember(uid) {
   m.openPopup();
 }
 
+// refresh the "x min ago" labels only (no page reload)
 setInterval(() => {
   if (circle) {
     drawPins();
     renderMembers();
   }
-}, 30000);
+}, 10000);
 
-// ---------- LOCATION SHARING & REFRESH ----------
+// =====================================================================
+//  LOCATION SHARING (auto-update every 10 seconds, Life360 style)
+// =====================================================================
+const prefKey = () => "sharing:" + (me ? me.uid : "");
+function getSharePref() {
+  try { return localStorage.getItem(prefKey()) === "1"; } catch { return false; }
+}
+function setSharePref(on) {
+  try { localStorage.setItem(prefKey(), on ? "1" : "0"); } catch { /* ignore */ }
+}
+
 function updateShareButton() {
   const btn = $("share-btn");
   if (!btn) return;
   btn.textContent = sharing ? "Pause sharing" : "Share my location";
   btn.classList.toggle("is-sharing", sharing);
+}
+
+// Keep the screen/CPU awake so updates keep coming while the app is open
+async function requestWakeLock() {
+  try {
+    if ("wakeLock" in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    }
+  } catch { /* not supported or denied */ }
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 
 function startSharing() {
@@ -602,38 +850,49 @@ function startSharing() {
     return;
   }
   sharing = true;
-  lastWrite = 0;
+  lastPos = null;
   updateShareButton();
   setStatus("Finding your location… please allow permission.", "refreshing");
+  requestWakeLock();
 
-  watchId = navigator.geolocation.watchPosition(onPosition, onPositionError, {
-    enableHighAccuracy: true,
-    maximumAge: 0,
-    timeout: 20000,
-  });
+  // watchPosition just keeps the freshest GPS fix; the timer below does the writing
+  watchId = navigator.geolocation.watchPosition(
+    (pos) => {
+      const first = !lastPos;
+      lastPos = pos;
+      if (first) writeLocation(pos); // show up on the map right away
+    },
+    onPositionError,
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 }
+  );
 
-  start30SecLocationLoop();
+  if (locationTimer) clearInterval(locationTimer);
+  locationTimer = setInterval(locationTick, LOCATION_INTERVAL_MS);
 }
 
-function start30SecLocationLoop() {
-  if (locationSyncInterval) clearInterval(locationSyncInterval);
-
-  locationSyncInterval = setInterval(() => {
-    if (!sharing || !circle) return;
-
-    navigator.geolocation.getCurrentPosition(
-      (pos) => onPosition(pos, true),
-      (err) => console.log("30s location pulse:", err.message),
-      { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
-    );
-  }, 30000);
+function locationTick() {
+  if (!sharing || !circle || locationBusy) return;
+  locationBusy = true;
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      lastPos = pos;
+      writeLocation(pos).finally(() => { locationBusy = false; });
+    },
+    () => {
+      // GPS didn't answer in time: reuse the last fix if it's still fresh
+      if (lastPos && Date.now() - lastPos.timestamp < 60000) {
+        writeLocation(lastPos).finally(() => { locationBusy = false; });
+      } else {
+        locationBusy = false;
+        setStatus("Still looking for your location…", "refreshing");
+      }
+    },
+    { enableHighAccuracy: true, maximumAge: 5000, timeout: 8000 }
+  );
 }
 
-async function onPosition(pos, force = false) {
-  const now = Date.now();
-  if (!force && now - lastWrite < 5000) return;
-  lastWrite = now;
-
+async function writeLocation(pos) {
+  if (!circle || !sharing) return;
   const { latitude, longitude, accuracy } = pos.coords;
   try {
     await setDoc(doc(db, "circles", circle.id, "locations", me.uid), {
@@ -641,7 +900,7 @@ async function onPosition(pos, force = false) {
       lat: latitude,
       lng: longitude,
       accuracy: Math.round(accuracy),
-      updatedAt: now,
+      updatedAt: Date.now(),
     });
     setStatus("Sharing your location with " + circle.name + ".", "active");
   } catch (err) {
@@ -653,6 +912,7 @@ async function onPosition(pos, force = false) {
 
 async function onPositionError(err) {
   if (err.code === 1) {
+    setSharePref(false);
     await stopSharing();
     const errText = "Location is blocked. Please allow Location in your phone settings.";
     setStatus(errText, "error");
@@ -666,9 +926,12 @@ async function onPositionError(err) {
 
 async function stopSharing(message) {
   if (watchId !== null) navigator.geolocation.clearWatch(watchId);
-  if (locationSyncInterval) clearInterval(locationSyncInterval);
+  if (locationTimer) clearInterval(locationTimer);
   watchId = null;
-  locationSyncInterval = null;
+  locationTimer = null;
+  locationBusy = false;
+  lastPos = null;
+  releaseWakeLock();
 
   const wasSharing = sharing;
   sharing = false;
@@ -684,8 +947,30 @@ async function stopSharing(message) {
 }
 
 $("share-btn").addEventListener("click", () => {
-  if (sharing) stopSharing("Sharing is paused. Your circle can't see you.");
-  else startSharing();
+  if (sharing) {
+    setSharePref(false);
+    stopSharing("Sharing is paused. Your circle can't see you.");
+  } else {
+    setSharePref(true);
+    startSharing();
+  }
+});
+
+// When the app comes back to the foreground, catch up immediately
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") {
+    stopTalking();
+    return;
+  }
+  if (sharing) {
+    requestWakeLock();
+    locationTick();
+  }
+  if (circle) {
+    if (micTrack && micTrack.readyState !== "live") micTrack = null;
+    healthCheck();
+    unlockAudio();
+  }
 });
 
 // ---------- circle: create / join / leave ----------
@@ -761,14 +1046,13 @@ $("join-form").addEventListener("submit", async (e) => {
 $("leave").addEventListener("click", async () => {
   if (!confirm("Leave " + circle.name + "? You can rejoin later with the invite code.")) return;
   try {
-    await stopStreamingAudio();
+    teardownVoice();
+    setSharePref(false);
     await stopSharing();
     if (unsubMembers) unsubMembers();
     if (unsubLocs) unsubLocs();
     if (unsubChat) unsubChat();
-    if (unsubVoiceSignal) unsubVoiceSignal();
-    unsubMembers = unsubLocs = unsubChat = unsubVoiceSignal = null;
-    closeAllPeerConnections();
+    unsubMembers = unsubLocs = unsubChat = null;
 
     for (const m of markers.values()) m.remove();
     markers.clear();
