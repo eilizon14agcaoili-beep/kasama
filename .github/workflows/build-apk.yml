@@ -47,8 +47,8 @@ jobs:
 
       - name: Generate App Icons & Splash
         run: |
-          npm install -D @capacitor/assets
-          npx capacitor-assets generate --iconPath www/icon.jpg || true
+          npm install -g @capacitor/assets
+          capacitor-assets generate --iconPath www/icon.jpg || true
 
       - name: Build APK via Gradle
         run: |
