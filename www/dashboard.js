@@ -825,7 +825,7 @@ function setSharePref(on) {
 function updateShareButton() {
   const btn = $("share-btn");
   if (!btn) return;
-  btn.textContent = sharing ? "Pause sharing" : "Share my location";
+  btn.textContent = sharing ? "Pause Driving" : "Start Driving";
   btn.classList.toggle("is-sharing", sharing);
 }
 
