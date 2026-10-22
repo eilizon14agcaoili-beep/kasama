@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>RGCD – Dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -64,7 +64,7 @@
         <h3>Map</h3>
         <button id="share-btn" class="btn btn--small" type="button">Share my location</button>
       </div>
-      <p id="map-status" class="map-status" role="status">Your location stays private until you tap Share my location.</p>
+      <p id="map-status" class="map-status" role="status">Your location stays private until you tap Share my location. Once on, it updates every 10 seconds.</p>
       <div id="map"></div>
     </section>
 
@@ -89,10 +89,11 @@
     <section class="panel panel--ptt" aria-label="Walkie talkie">
       <h3>Walkie talkie</h3>
       <button class="ptt" id="ptt" type="button">Hold to talk</button>
-      <p class="hint" id="ptt-status" role="status">Hold the button and speak. Release to send.</p>
+      <p class="hint" id="ptt-status" role="status">Connecting voice… Everyone can talk at the same time.</p>
     </section>
   </main>
 
+  <!-- Leaflet must load BEFORE the module script -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script type="module" src="dashboard.js"></script>
 </body>
