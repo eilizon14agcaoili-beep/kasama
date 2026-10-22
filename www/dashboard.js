@@ -26,7 +26,7 @@ let didFit = false;
 const LOCATION_INTERVAL_MS = 10000;   // auto-refresh every 10 seconds
 let watchId = null;
 let sharing = false;
-let lastPos = null;                   // latest GPS fix from watchPosition
+let lastPos = null;                    // latest GPS fix from watchPosition
 let locationTimer = null;
 let locationBusy = false;
 let wakeLock = null;
@@ -260,30 +260,16 @@ $("chat-form").addEventListener("submit", async (e) => {
 
 // =====================================================================
 //  WALKIE-TALKIE (persistent mesh, full-duplex, many speakers at once)
-//
-//  How it works now:
-//   - Every member keeps ONE always-on WebRTC connection to every other
-//     member (mesh). Nobody has to "start a call" when pressing the button.
-//   - Pressing the button only turns the mic track ON (track.enabled), so
-//     audio starts instantly and nothing needs to be renegotiated.
-//   - Each peer has its own <audio> element, so the browser mixes any number
-//     of people talking at the same time.
-//   - The mic is opened once and re-opened automatically if the browser
-//     kills it (this fixes "nawawala yung mic after matagal").
 // =====================================================================
-
 const rtcConfig = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
-    // IMPORTANT: add a TURN server for mobile data / strict networks.
-    // Without TURN, many phones on mobile data can NOT hear each other.
-    // { urls: "turn:YOUR_TURN_HOST:3478", username: "USER", credential: "PASS" },
   ],
   iceCandidatePoolSize: 2,
 };
 
-const peers = new Map();        // uid -> entry (see getEntry)
+const peers = new Map();         // uid -> entry
 const remoteTalkers = new Map(); // uid -> name of people currently talking
 let unsubVoiceSignal = null;
 let signalQueue = Promise.resolve();
@@ -315,7 +301,6 @@ async function sendSignal(targetUid, type, session, payload = {}) {
   }
 }
 
-// ----- UI -----
 function setPttStatus(text) {
   if ($("ptt-status")) $("ptt-status").textContent = text;
 }
@@ -347,7 +332,6 @@ function updateVoiceUI() {
   }
 }
 
-// ----- microphone (opened once, auto-recovers) -----
 async function ensureMic() {
   if (micTrack && micTrack.readyState === "live") return micTrack;
   if (micPromise) return micPromise;
@@ -357,9 +341,9 @@ async function ensureMic() {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
     });
     const track = stream.getAudioTracks()[0];
-    track.enabled = false; // silent until the button is held
+    track.enabled = false;
     track.addEventListener("ended", () => {
-      if (micTrack === track) micTrack = null; // will be re-opened on next press
+      if (micTrack === track) micTrack = null;
     });
     micTrack = track;
     for (const e of peers.values()) {
@@ -389,7 +373,7 @@ async function startTalking() {
   pttHeld = true;
   try {
     const track = await ensureMic();
-    if (!pttHeld) return;            // released while the mic was opening
+    if (!pttHeld) return;
     track.enabled = true;
     talking = true;
     broadcastTalking(true);
@@ -411,7 +395,6 @@ function stopTalking() {
   updateVoiceUI();
 }
 
-// ----- peers -----
 function getEntry(uid, name) {
   let e = peers.get(uid);
   if (!e) {
@@ -423,7 +406,7 @@ function getEntry(uid, name) {
     e = {
       uid,
       name: name || "Member",
-      initiator: me.uid < uid,   // lower uid always creates the offer (no collisions)
+      initiator: me.uid < uid,
       pc: null,
       dc: null,
       sender: null,
@@ -468,7 +451,6 @@ function createPc(e, session) {
   e.session = session;
   e.startedAt = Date.now();
 
-  // negotiated data channel: both sides create it with the same id (used for "X is talking")
   const dc = pc.createDataChannel("ptt", { negotiated: true, id: 0 });
   e.dc = dc;
   dc.onopen = () => { if (talking) broadcastTalking(true); };
@@ -487,7 +469,7 @@ function createPc(e, session) {
 
   pc.ontrack = (ev) => {
     e.audio.srcObject = ev.streams[0] || new MediaStream([ev.track]);
-    e.audio.play().catch(() => { /* will be unlocked on next tap, see unlockAudio */ });
+    e.audio.play().catch(() => {});
   };
 
   pc.onconnectionstatechange = () => {
@@ -555,7 +537,6 @@ async function handleCandidate(e, data) {
   await flushIce(e);
 }
 
-// ICE candidates can arrive before the remote description, so queue them
 async function flushIce(e) {
   const pc = e.pc;
   if (!pc || !pc.remoteDescription) return;
@@ -570,12 +551,10 @@ async function flushIce(e) {
   e.pendingIce = keep;
 }
 
-// Start (or restart) the connection to one peer
 function connectPeer(e) {
   if (e.initiator) {
     startOffer(e);
   } else {
-    // ask the initiator to (re)send an offer
     sendSignal(e.uid, "hello", null);
   }
 }
@@ -596,7 +575,6 @@ function syncPeers() {
   updateVoiceUI();
 }
 
-// Reconnect anything that is dead or stuck
 function healthCheck() {
   if (!circle) return;
   const now = Date.now();
@@ -615,7 +593,6 @@ function setupVoice() {
   let first = true;
   const q = query(signalsCol(), where("targetUid", "==", me.uid));
   unsubVoiceSignal = onSnapshot(q, (snapshot) => {
-    // Old signals left over from earlier sessions: throw them away
     if (first) {
       first = false;
       snapshot.docs.forEach((d) => deleteDoc(d.ref).catch(() => {}));
@@ -666,7 +643,6 @@ function teardownVoice() {
   updateVoiceUI();
 }
 
-// Mobile browsers block audio until the user taps something: unlock on any tap
 function unlockAudio() {
   for (const e of peers.values()) {
     if (e.audio.srcObject && e.audio.paused) e.audio.play().catch(() => {});
@@ -691,12 +667,28 @@ if (pttBtn) {
 }
 window.addEventListener("blur", stopTalking);
 
-// ---------- members list ----------
+// ---------- members list (with Owner Remove Support) ----------
+async function removeMember(memberUid, memberName) {
+  if (!confirm(`Talagang gusto mong alisin si ${memberName} sa circle na ito?`)) return;
+  try {
+    // Tanggalin sa members collection
+    await deleteDoc(doc(db, "circles", circle.id, "members", memberUid));
+    // Tanggalin din ang circleId reference sa user document para bumalik sa gate screen ang pinalis
+    await setDoc(doc(db, "users", memberUid), { circleId: null }, { merge: true });
+    showToast(`Naalis si ${memberName} sa circle.`);
+  } catch (err) {
+    const errText = friendlyError(err);
+    showToast(errText, true);
+  }
+}
+
 function renderMembers() {
   const list = $("members");
   if (!list) return;
   list.replaceChildren();
   $("member-count").textContent = people.length;
+
+  const isUserOwner = circle && circle.ownerId === me.uid;
 
   for (const p of people) {
     const li = document.createElement("li");
@@ -738,6 +730,20 @@ function renderMembers() {
       tag.textContent = t;
       li.append(tag);
     }
+
+    // Kung ikaw ang owner at hindi mo sarili ang row, lagyan ng "Remove" button
+    if (isUserOwner && p.id !== me.uid) {
+      const removeBtn = document.createElement("button");
+      removeBtn.textContent = "Remove";
+      removeBtn.className = "btn-remove"; // Maaari mong lagyan ng estilo sa CSS
+      removeBtn.style.cssText = "background: #dc2626; color: white; border: none; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; margin-left: 8px; width: auto;";
+      removeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        removeMember(p.id, p.name);
+      });
+      li.append(removeBtn);
+    }
+
     list.append(li);
   }
 }
@@ -803,7 +809,6 @@ function focusMember(uid) {
   m.openPopup();
 }
 
-// refresh the "x min ago" labels only (no page reload)
 setInterval(() => {
   if (circle) {
     drawPins();
@@ -812,7 +817,7 @@ setInterval(() => {
 }, 10000);
 
 // =====================================================================
-//  LOCATION SHARING (auto-update every 10 seconds, Life360 style)
+//  LOCATION SHARING
 // =====================================================================
 const prefKey = () => "sharing:" + (me ? me.uid : "");
 function getSharePref() {
@@ -829,7 +834,6 @@ function updateShareButton() {
   btn.classList.toggle("is-sharing", sharing);
 }
 
-// Keep the screen/CPU awake so updates keep coming while the app is open
 async function requestWakeLock() {
   try {
     if ("wakeLock" in navigator && !wakeLock) {
@@ -855,12 +859,11 @@ function startSharing() {
   setStatus("Finding your location… please allow permission.", "refreshing");
   requestWakeLock();
 
-  // watchPosition just keeps the freshest GPS fix; the timer below does the writing
   watchId = navigator.geolocation.watchPosition(
     (pos) => {
       const first = !lastPos;
       lastPos = pos;
-      if (first) writeLocation(pos); // show up on the map right away
+      if (first) writeLocation(pos);
     },
     onPositionError,
     { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 }
@@ -879,7 +882,6 @@ function locationTick() {
       writeLocation(pos).finally(() => { locationBusy = false; });
     },
     () => {
-      // GPS didn't answer in time: reuse the last fix if it's still fresh
       if (lastPos && Date.now() - lastPos.timestamp < 60000) {
         writeLocation(lastPos).finally(() => { locationBusy = false; });
       } else {
@@ -956,7 +958,6 @@ $("share-btn").addEventListener("click", () => {
   }
 });
 
-// When the app comes back to the foreground, catch up immediately
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") {
     stopTalking();
@@ -1068,9 +1069,8 @@ $("leave").addEventListener("click", async () => {
 $("copy-code").addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(circle.code);
-    $("copy-code").textContent = "Copied";
-  } catch {
-    $("copy-code").textContent = "Select and copy";
+    showToast("Copied code to clipboard!");
+  } catch (err) {
+    showToast("Failed to copy code.", true);
   }
-  setTimeout(() => ($("copy-code").textContent = "Copy"), 1800);
 });
